@@ -1,94 +1,174 @@
 package ratelimit
 
 import (
+	"errors"
 	"fmt"
 	"sync/atomic"
 
 	"time"
 )
 
-type rateLimit struct {
-	burstRate, nGOing                int32
-	limitPerTime, curRoutinesPerTime int32
-	cmds                             <-chan func()
-}
-
 type Opts struct {
-	RateLimitTime time.Duration // per sec/min/...
-	CheckTime     time.Duration // sleep before retrying to check is cmd can run
+	BurstRate       int64  // max parallel commands
+	CMDLimitPerTime uint64 // max commands per {time}
+	Commands        <-chan func()
+	ReturnChan      chan<- func()
+
+	// per sec/min/...
+	RateLimitTime *time.Duration
+	// how often check for new tokens
+	NewTokenIssueFreq *time.Duration
 }
 
-var o = Opts{
-	RateLimitTime: time.Second,
-	CheckTime:     100 * time.Microsecond, // 0.1 ms = 1e4 per sec
+type rateLimit struct {
+	burstRate       int64
+	cmdLimitPerTime uint64
+	commands        <-chan func()
+	returnChanBuf   chan func()
+	returnChanReal  chan<- func()
 }
 
-func New(burstRate, limitPerTime int32, cmds <-chan func(), opts *Opts) error {
+type state struct {
+	tokens   uint64
+	leftover uint64
+	lastUpd  time.Time
+}
+
+var (
+	rateLimitTime     time.Duration
+	newTokenIssueFreq uint64
+	tokenPerMS        uint64
+	returnChan        bool
+)
+
+// Rate limit implementation of leaky token algorithm
+// By default limits per minute and "checks" every ms for new tokens
+//
+// NB: LEAKS IF NOT CLOSE Commands chan
+func RunRateLimiter(o *Opts) error {
+	name := errors.New("rate limiter")
 	switch {
-	case burstRate < 1:
-		return fmt.Errorf("burst rate can't be less than 1")
-	case limitPerTime < 1:
-		return fmt.Errorf("limit per time can't be less than 1")
-	case cmds == nil:
-		return fmt.Errorf("cmds are nil chan")
-	case opts != nil && (opts.CheckTime < 0 || opts.RateLimitTime < 0):
-		return fmt.Errorf("check options format")
+	case o == nil:
+		return fmt.Errorf("%s: Opts is nil", name)
+	case o.Commands == nil:
+		return fmt.Errorf("%s: Commands is nil chan", name)
+	case o.BurstRate < 1:
+		return fmt.Errorf("%s: BurstRate must be > 0", name)
+	case o.CMDLimitPerTime < 1:
+		return fmt.Errorf("%s: CMDLimitPerTime must be > 0", name)
+	case o.NewTokenIssueFreq != nil && *o.NewTokenIssueFreq < 1:
+		return fmt.Errorf("%s: NewTokenIssueFreq must be > 0", name)
+	case o.RateLimitTime != nil && *o.RateLimitTime < 1:
+		return fmt.Errorf("%s: RateLimitTime must be > 0", name)
+	case o.RateLimitTime != nil && o.NewTokenIssueFreq != nil &&
+		*o.RateLimitTime < *o.NewTokenIssueFreq:
+		return fmt.Errorf("%s: NewTokenIssueFreq must be < RateLimitTime", name)
 	}
 
-	rt := &rateLimit{
-		burstRate:    burstRate,
-		limitPerTime: limitPerTime,
-		cmds:         cmds,
-	}
-
-	if opts != nil {
-		o = *opts
-	}
+	rt := initRates(*o)
 
 	go rt.run()
 
 	return nil
 }
 
+func initRates(o Opts) *rateLimit {
+	rt := &rateLimit{
+		burstRate:       o.BurstRate,
+		cmdLimitPerTime: o.CMDLimitPerTime,
+		commands:        o.Commands,
+		returnChanReal:  o.ReturnChan,
+	}
+
+	returnChan = false
+	if o.ReturnChan != nil {
+		returnChan = true
+		rt.returnChanBuf = make(chan func(), 1024)
+		go returning(rt.returnChanBuf, rt.returnChanReal)
+	}
+
+	rateLimitTime = time.Minute
+	if o.RateLimitTime != nil {
+		rateLimitTime = *o.RateLimitTime
+	}
+
+	newTokenIssueFreq = uint64(time.Millisecond)
+	if o.NewTokenIssueFreq != nil {
+		newTokenIssueFreq = uint64(*o.NewTokenIssueFreq)
+	}
+
+	tokenPerMS = uint64(rateLimitTime) / rt.cmdLimitPerTime
+
+	return rt
+}
+
 func (rl *rateLimit) run() {
-	now, prevTime := time.Now(), time.Now()
+	var nGOing int64
+	state := state{
+		tokens:   rl.cmdLimitPerTime,
+		lastUpd:  time.Now(),
+		leftover: 0,
+	}
 
-	for cmd := range rl.cmds {
-	retry:
-		now = time.Now()
-
-		if now.Sub(prevTime) > o.RateLimitTime {
-			atomic.StoreInt32(&rl.curRoutinesPerTime, 1)
-			prevTime = now
-			rl.runCmd(cmd, false, now)
+	for cmd := range rl.commands {
+		if atomic.LoadInt64(&nGOing) >= rl.burstRate {
+			if returnChan {
+				rl.returnChanBuf <- cmd
+			}
 			continue
 		}
 
-		if atomic.LoadInt32(&rl.curRoutinesPerTime) >= rl.limitPerTime {
-			time.Sleep(o.CheckTime)
-			goto retry
+		state = updState(state, rl.cmdLimitPerTime)
+
+		if state.tokens > 0 {
+			state.tokens--
+			atomic.AddInt64(&nGOing, 1)
+
+			go func(f func()) {
+				f()
+				atomic.AddInt64(&nGOing, -1)
+			}(cmd)
+
+		} else if returnChan {
+			rl.returnChanBuf <- cmd
 		}
-		rl.runCmd(cmd, true, now)
+	} //end for
+
+	if returnChan {
+		close(rl.returnChanBuf)
 	}
 }
 
-func (rl *rateLimit) runCmd(cmd func(), deltaMinute bool, prevTime time.Time) {
-	for atomic.LoadInt32(&rl.nGOing) >= rl.burstRate {
-		time.Sleep(o.CheckTime)
+func updState(s state, limitPerTime uint64) state {
+	if s.tokens == limitPerTime {
+		return s
 	}
 
-	atomic.AddInt32(&rl.nGOing, 1)
+	now := time.Now()
 
-	if deltaMinute {
-		atomic.AddInt32(&rl.curRoutinesPerTime, 1)
+	elapsed := uint64(now.Sub(s.lastUpd)) + s.leftover
+	// count elapsed time with fraction of newTokenIssueFreq,
+	// ie do we must upd tokens now or not
+	if (elapsed / newTokenIssueFreq) < 1 {
+		return s
 	}
 
-	go func() {
-		cmd()
+	newTokens := elapsed / tokenPerMS
+	s.leftover = elapsed - (newTokens * tokenPerMS)
+	s.tokens += newTokens
 
-		atomic.AddInt32(&rl.nGOing, -1)
-		if time.Now().Sub(prevTime) < o.RateLimitTime {
-			atomic.AddInt32(&rl.curRoutinesPerTime, -1)
-		}
-	}()
+	if s.tokens >= limitPerTime {
+		s.tokens = limitPerTime
+		s.leftover = 0
+	}
+
+	s.lastUpd = now
+	return s
+}
+
+func returning(buf <-chan func(), real chan<- func()) {
+	for cmd := range buf {
+		real <- cmd
+	}
+	close(real)
 }
