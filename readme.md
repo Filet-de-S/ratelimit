@@ -1,4 +1,4 @@
-##Go rate limiter
+## Go rate limiter
 Package provides an implementation of the leaky token algorithm
 
 - Accepts func through a `Commands` channel and GOrunning it if bandwidth allows; in refused case sends it to a return channel, if exists
