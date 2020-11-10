@@ -10,10 +10,6 @@ import (
 	"time"
 )
 
-func someCmd(dur time.Duration) {
-	time.Sleep(dur)
-}
-
 func TestFunctional(t *testing.T) {
 	testTokenBudget(t, state{
 		tokens:   0,
@@ -36,7 +32,7 @@ func TestFunctional(t *testing.T) {
 	var limitPerTime uint64 = 25
 	rateLimitTime = time.Second
 	newTokenIssueFreq = uint64(time.Second / 2)
-	tokenPerMS = uint64(rateLimitTime) / limitPerTime
+	tokenPerTime = uint64(rateLimitTime) / limitPerTime
 	testTokenBudget(t, state{
 		tokens:   0,
 		leftover: 0,
@@ -77,7 +73,7 @@ func testLimitPerTime(t *testing.T) {
 		BurstRate:       100,
 		CMDLimitPerTime: 5,
 		RateLimitTime:   &sleepTime_,
-	}, 5, 10, sleepTime_, 590*time.Millisecond, "testLimitPerTime")
+	}, 5, 10, sleepTime_, 590*time.Millisecond, nil, "testLimitPerTime")
 }
 
 func testBurst(t *testing.T) {
@@ -86,7 +82,7 @@ func testBurst(t *testing.T) {
 		BurstRate:       50,
 		CMDLimitPerTime: 100,
 		RateLimitTime:   &sleepTime_,
-	}, 50, 100, sleepTime_, 590*time.Millisecond, "testBurst")
+	}, 50, 100, sleepTime_, 590*time.Millisecond, nil, "testBurst")
 }
 
 func testBurst2(t *testing.T) {
@@ -95,38 +91,75 @@ func testBurst2(t *testing.T) {
 		BurstRate:       100,
 		CMDLimitPerTime: 100,
 		RateLimitTime:   &sleepTime_,
-	}, 100, 100, sleepTime_, 1090*time.Millisecond, "testBurst2")
+	}, 100, 100, sleepTime_, 1090*time.Millisecond, nil, "testBurst2")
 }
 
 func testReturnChan(t *testing.T) {
-	backChan := make(chan func(), 50)
+	backChan := make(chan Command, 50)
 	sleepTime_ := time.Second / 2
+	var canceled int
+
 	testFunc(t, &Opts{
 		BurstRate:       50,
 		CMDLimitPerTime: 100,
 		RateLimitTime:   &sleepTime_,
 		ReturnChan:      backChan,
-	}, 50, 100, sleepTime_, 590*time.Millisecond, "testReturnChan")
+	}, 50, 100, sleepTime_, 590*time.Millisecond,
+		func() {
+			canceled++
+		}, "testReturnChan1")
 
 	i := 0
 	for range backChan {
 		i++
 	}
-	if i != 50 {
-		t.Fatal("testReturnChan expects 50 return cmds, have", i)
+	if i != 50 || canceled != 0 {
+		t.Fatal("testReturnChan1 expects 50 return cmds and 0 canceled, have", i, canceled)
+	}
+
+	// testCancelFunc
+	testFunc(t, &Opts{
+		BurstRate:       50,
+		CMDLimitPerTime: 100,
+		RateLimitTime:   &sleepTime_,
+	}, 50, 100, sleepTime_, 590*time.Millisecond,
+		func() {
+			canceled++
+		}, "testCancelFunc")
+	if canceled != 50 {
+		t.Fatal("testCancelFunc expects 50 canceled, have", canceled)
 	}
 }
 
-func testFunc(t *testing.T, o *Opts, needToBeDone, nLoop int,
-	sleepTime, gt time.Duration, name string) {
-	name += ":"
+func someCmd(dur time.Duration) {
+	time.Sleep(dur)
+}
 
-	ch := make(chan func(), needToBeDone)
+type testCommand struct {
+	do, cancel func()
+}
+
+func (tc *testCommand) Do() {
+	tc.do()
+}
+
+func (tc *testCommand) Cancel() {
+	tc.cancel()
+}
+
+func testFunc(t *testing.T, o *Opts, needToBeDone, nLoop int,
+	sleepTime, gt time.Duration, cancel func(), name string) {
+	name += ":"
+	if cancel == nil {
+		cancel = func() {}
+	}
+
+	ch := make(chan Command, needToBeDone)
 	o.Commands = ch
 
 	startgn := runtime.NumGoroutine()
 
-	err := RunRateLimiter(o)
+	err := Run(o)
 	if err != nil {
 		t.Fatal(name, err)
 	}
@@ -144,10 +177,13 @@ func testFunc(t *testing.T, o *Opts, needToBeDone, nLoop int,
 	now := time.Now()
 
 	for i := 0; i < nLoop; i++ {
-		ch <- func() {
-			someCmd(sleepTime)
-			wg.Done()
-			atomic.AddInt32(&completed, 1)
+		ch <- &testCommand{
+			do: func() {
+				someCmd(sleepTime)
+				wg.Done()
+				atomic.AddInt32(&completed, 1)
+			},
+			cancel: cancel,
 		}
 	}
 	close(ch)
@@ -169,7 +205,7 @@ func testFunc(t *testing.T, o *Opts, needToBeDone, nLoop int,
 
 func BenchmarkRateLimiter(b *testing.B) {
 	for n := 1e5; n < 1e8; n *= 10 {
-		ch := make(chan func(), int32(1e5))
+		ch := make(chan Command, int32(1e5))
 		o := Opts{
 			BurstRate:       int64(n / 10 / 10),
 			CMDLimitPerTime: uint64(n),
@@ -180,7 +216,7 @@ func BenchmarkRateLimiter(b *testing.B) {
 
 		startgn := runtime.NumGoroutine()
 
-		err := RunRateLimiter(&o)
+		err := Run(&o)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -190,10 +226,10 @@ func BenchmarkRateLimiter(b *testing.B) {
 
 		var completed int64
 		for i := 0; i < l; i++ {
-			ch <- func() {
+			ch <- &testCommand{do: func() {
 				time.Sleep(time.Millisecond)
 				atomic.AddInt64(&completed, 1)
-			}
+			}, cancel: func() {}}
 		}
 		close(ch)
 

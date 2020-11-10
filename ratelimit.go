@@ -11,8 +11,8 @@ import (
 type Opts struct {
 	BurstRate       int64  // max parallel commands
 	CMDLimitPerTime uint64 // max commands per {time}
-	Commands        <-chan func()
-	ReturnChan      chan<- func()
+	Commands        <-chan Command
+	ReturnChan      chan<- Command
 
 	// per sec/min/...
 	RateLimitTime *time.Duration
@@ -20,12 +20,17 @@ type Opts struct {
 	NewTokenIssueFreq *time.Duration
 }
 
+type Command interface {
+	Do()
+	Cancel()
+}
+
 type rateLimit struct {
 	burstRate       int64
 	cmdLimitPerTime uint64
-	commands        <-chan func()
-	returnChanBuf   chan func()
-	returnChanReal  chan<- func()
+	commands        <-chan Command
+	returnChanBuf   chan Command
+	returnChanReal  chan<- Command
 }
 
 type state struct {
@@ -37,7 +42,7 @@ type state struct {
 var (
 	rateLimitTime     time.Duration
 	newTokenIssueFreq uint64
-	tokenPerMS        uint64
+	tokenPerTime      uint64
 	returnChan        bool
 )
 
@@ -45,7 +50,7 @@ var (
 // By default limits per minute and "checks" every ms for new tokens
 //
 // NB: LEAKS IF NOT CLOSE Commands chan
-func RunRateLimiter(o *Opts) error {
+func Run(o *Opts) error {
 	name := errors.New("rate limiter")
 	switch {
 	case o == nil:
@@ -83,7 +88,7 @@ func initRates(o Opts) *rateLimit {
 	returnChan = false
 	if o.ReturnChan != nil {
 		returnChan = true
-		rt.returnChanBuf = make(chan func(), 1024)
+		rt.returnChanBuf = make(chan Command, 1024)
 		go returning(rt.returnChanBuf, rt.returnChanReal)
 	}
 
@@ -97,7 +102,7 @@ func initRates(o Opts) *rateLimit {
 		newTokenIssueFreq = uint64(*o.NewTokenIssueFreq)
 	}
 
-	tokenPerMS = uint64(rateLimitTime) / rt.cmdLimitPerTime
+	tokenPerTime = uint64(rateLimitTime) / rt.cmdLimitPerTime
 
 	return rt
 }
@@ -112,9 +117,7 @@ func (rl *rateLimit) run() {
 
 	for cmd := range rl.commands {
 		if atomic.LoadInt64(&nGOing) >= rl.burstRate {
-			if returnChan {
-				rl.returnChanBuf <- cmd
-			}
+			rl.returnCase(cmd)
 			continue
 		}
 
@@ -124,13 +127,13 @@ func (rl *rateLimit) run() {
 			state.tokens--
 			atomic.AddInt64(&nGOing, 1)
 
-			go func(f func()) {
-				f()
+			go func(f Command) {
+				f.Do()
 				atomic.AddInt64(&nGOing, -1)
 			}(cmd)
 
-		} else if returnChan {
-			rl.returnChanBuf <- cmd
+		} else {
+			rl.returnCase(cmd)
 		}
 	} //end for
 
@@ -153,8 +156,8 @@ func updState(s state, limitPerTime uint64) state {
 		return s
 	}
 
-	newTokens := elapsed / tokenPerMS
-	s.leftover = elapsed - (newTokens * tokenPerMS)
+	newTokens := elapsed / tokenPerTime
+	s.leftover = elapsed - (newTokens * tokenPerTime)
 	s.tokens += newTokens
 
 	if s.tokens >= limitPerTime {
@@ -166,7 +169,16 @@ func updState(s state, limitPerTime uint64) state {
 	return s
 }
 
-func returning(buf <-chan func(), real chan<- func()) {
+func (rl *rateLimit) returnCase(cmd Command) {
+	switch {
+	case returnChan:
+		rl.returnChanBuf <- cmd
+	default:
+		cmd.Cancel()
+	}
+}
+
+func returning(buf <-chan Command, real chan<- Command) {
 	for cmd := range buf {
 		real <- cmd
 	}
