@@ -9,7 +9,7 @@ import (
 )
 
 type Opts struct {
-	BurstRate       int64  // max parallel commands
+	BurstRate       int64  // max concurrent commands
 	CMDLimitPerTime uint64 // max commands per {time}
 	Commands        <-chan Command
 	ReturnChan      chan<- Command
@@ -26,11 +26,15 @@ type Command interface {
 }
 
 type rateLimit struct {
-	burstRate       int64
-	cmdLimitPerTime uint64
-	commands        <-chan Command
-	returnChanBuf   chan Command
-	returnChanReal  chan<- Command
+	burstRate         int64
+	cmdsLimitPerTime  uint64
+	rateLimitTime     time.Duration
+	newTokenIssueFreq uint64
+	tokenPerTime      uint64
+	commands          <-chan Command
+
+	returnChanBuf  chan Command
+	returnChanReal chan<- Command
 }
 
 type state struct {
@@ -38,13 +42,6 @@ type state struct {
 	leftover uint64
 	lastUpd  time.Time
 }
-
-var (
-	rateLimitTime     time.Duration
-	newTokenIssueFreq uint64
-	tokenPerTime      uint64
-	returnChan        bool
-)
 
 // Rate limit implementation of leaky token algorithm
 // By default limits per minute and "checks" every ms for new tokens
@@ -79,30 +76,28 @@ func Run(o *Opts) error {
 
 func initRates(o Opts) *rateLimit {
 	rt := &rateLimit{
-		burstRate:       o.BurstRate,
-		cmdLimitPerTime: o.CMDLimitPerTime,
-		commands:        o.Commands,
-		returnChanReal:  o.ReturnChan,
+		burstRate:        o.BurstRate,
+		cmdsLimitPerTime: o.CMDLimitPerTime,
+		commands:         o.Commands,
+		returnChanReal:   o.ReturnChan,
 	}
 
-	returnChan = false
 	if o.ReturnChan != nil {
-		returnChan = true
 		rt.returnChanBuf = make(chan Command, 1024)
 		go returning(rt.returnChanBuf, rt.returnChanReal)
 	}
 
-	rateLimitTime = time.Minute
+	rt.rateLimitTime = time.Minute
 	if o.RateLimitTime != nil {
-		rateLimitTime = *o.RateLimitTime
+		rt.rateLimitTime = *o.RateLimitTime
 	}
 
-	newTokenIssueFreq = uint64(time.Millisecond)
+	rt.newTokenIssueFreq = uint64(time.Millisecond)
 	if o.NewTokenIssueFreq != nil {
-		newTokenIssueFreq = uint64(*o.NewTokenIssueFreq)
+		rt.newTokenIssueFreq = uint64(*o.NewTokenIssueFreq)
 	}
 
-	tokenPerTime = uint64(rateLimitTime) / rt.cmdLimitPerTime
+	rt.tokenPerTime = uint64(rt.rateLimitTime) / rt.cmdsLimitPerTime
 
 	return rt
 }
@@ -110,7 +105,7 @@ func initRates(o Opts) *rateLimit {
 func (rl *rateLimit) run() {
 	var nGOing int64
 	state := state{
-		tokens:   rl.cmdLimitPerTime,
+		tokens:   rl.cmdsLimitPerTime,
 		lastUpd:  time.Now(),
 		leftover: 0,
 	}
@@ -121,7 +116,7 @@ func (rl *rateLimit) run() {
 			continue
 		}
 
-		state = updState(state, rl.cmdLimitPerTime)
+		state = rl.updState(state)
 
 		if state.tokens > 0 {
 			state.tokens--
@@ -137,13 +132,13 @@ func (rl *rateLimit) run() {
 		}
 	} //end for
 
-	if returnChan {
+	if rl.returnChanBuf != nil {
 		close(rl.returnChanBuf)
 	}
 }
 
-func updState(s state, limitPerTime uint64) state {
-	if s.tokens == limitPerTime {
+func (rl *rateLimit) updState(s state) state {
+	if s.tokens == rl.cmdsLimitPerTime {
 		return s
 	}
 
@@ -152,16 +147,16 @@ func updState(s state, limitPerTime uint64) state {
 	elapsed := uint64(now.Sub(s.lastUpd)) + s.leftover
 	// count elapsed time with fraction of newTokenIssueFreq,
 	// ie do we must upd tokens now or not
-	if (elapsed / newTokenIssueFreq) < 1 {
+	if (elapsed / rl.newTokenIssueFreq) < 1 {
 		return s
 	}
 
-	newTokens := elapsed / tokenPerTime
-	s.leftover = elapsed - (newTokens * tokenPerTime)
+	newTokens := elapsed / rl.tokenPerTime
+	s.leftover = elapsed - (newTokens * rl.tokenPerTime)
 	s.tokens += newTokens
 
-	if s.tokens >= limitPerTime {
-		s.tokens = limitPerTime
+	if s.tokens >= rl.cmdsLimitPerTime {
+		s.tokens = rl.cmdsLimitPerTime
 		s.leftover = 0
 	}
 
@@ -171,7 +166,7 @@ func updState(s state, limitPerTime uint64) state {
 
 func (rl *rateLimit) returnCase(cmd Command) {
 	switch {
-	case returnChan:
+	case rl.returnChanReal != nil:
 		rl.returnChanBuf <- cmd
 	default:
 		cmd.Cancel()

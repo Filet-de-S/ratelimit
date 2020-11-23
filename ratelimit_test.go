@@ -15,29 +15,33 @@ func TestFunctional(t *testing.T) {
 		tokens:   0,
 		leftover: 0,
 		lastUpd:  time.Now().Add(-6501 * time.Millisecond),
-	}, 1, 501, 10, true, "easyMath, minutes:")
+	}, 1, 501, 10, nil, "easyMath, minutes:")
 
 	testTokenBudget(t, state{
 		tokens:   9,
 		leftover: 0,
 		lastUpd:  time.Now().Add(-12300 * time.Millisecond),
-	}, 10, 0, 10, true, "overfill, minutes:")
+	}, 10, 0, 10, nil, "overfill, minutes:")
 
 	testTokenBudget(t, state{
 		tokens:   0,
 		leftover: uint64(5 * time.Second),
 		lastUpd:  time.Now().Add(-time.Second),
-	}, 1, 0, 10, true, "leftover, minutes:")
+	}, 1, 0, 10, nil, "leftover, minutes:")
 
 	var limitPerTime uint64 = 25
-	rateLimitTime = time.Second
-	newTokenIssueFreq = uint64(time.Second / 2)
-	tokenPerTime = uint64(rateLimitTime) / limitPerTime
+	rateLimitTime := time.Second
+	rl := &rateLimit{
+		cmdsLimitPerTime:  limitPerTime,
+		rateLimitTime:     rateLimitTime,
+		newTokenIssueFreq: uint64(time.Second / 2),
+		tokenPerTime:      uint64(rateLimitTime) / limitPerTime,
+	}
 	testTokenBudget(t, state{
 		tokens:   0,
 		leftover: 0,
 		lastUpd:  time.Now().Add(-500 * time.Millisecond),
-	}, 12, 20, limitPerTime, false, "seconds:")
+	}, 12, 20, limitPerTime, rl, "seconds:")
 
 	//wait a bit for finish of prev runtime.test goroutines
 	time.Sleep(30 * time.Millisecond)
@@ -55,11 +59,11 @@ func TestFunctional(t *testing.T) {
 }
 
 func testTokenBudget(t *testing.T, st state,
-	expT, expL, limPerTime uint64, init bool, name string) {
-	if init {
-		_ = initRates(Opts{CMDLimitPerTime: limPerTime})
+	expT, expL, limPerTime uint64, rl *rateLimit, name string) {
+	if rl == nil {
+		rl = initRates(Opts{CMDLimitPerTime: limPerTime})
 	}
-	s := updState(st, limPerTime)
+	s := rl.updState(st)
 
 	left := time.Duration(s.leftover).Milliseconds()
 	if s.tokens != expT || left != int64(expL) {
